@@ -1,240 +1,285 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
-	"sync"
 	"time"
 
 	"github.com/bnb-chain/tss-lib/v2/common"
-
 	keygen "github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	signing "github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
 )
 
-// số bên tham gia MPC
+// ===== cấu hình demo =====
 const (
 	partyCount = 3
-	threshold  = 2 // 2-of-3
+	// 2-of-3  => t = 1
+	threshold = 1
 )
 
-// một party cục bộ: giữ state TSS + 2 channel gửi/nhận
-type localParty struct {
-	id     *tss.PartyID
-	party  tss.Party
-	outCh  chan tss.Message
-	endKg  chan *keygen.LocalPartySaveData
-	endSig chan *common.SignatureData
+// gom trong 1 struct để dễ quản lý
+type kgNode struct {
+	id    *tss.PartyID
+	party tss.Party
+	out   chan tss.Message
+	done  chan *keygen.LocalPartySaveData
+}
+
+type signNode struct {
+	id    *tss.PartyID
+	party tss.Party
+	out   chan tss.Message
+	done  chan *common.SignatureData
 }
 
 func main() {
-	// ======== 1. Chuẩn bị danh sách party ID ========
+	// 1. tạo danh sách ID
 	parties := make([]*tss.PartyID, 0, partyCount)
 	for i := 0; i < partyCount; i++ {
-		// id string, moniker, uniqueKey (big.Int)
-		uid := big.NewInt(int64(i + 1))
-		pid := tss.NewPartyID(fmt.Sprintf("P%d", i+1), "", uid)
-		parties = append(parties, pid)
+		key := big.NewInt(int64(i + 1))
+		p := tss.NewPartyID(fmt.Sprintf("P%d", i+1), "", key)
+		parties = append(parties, p)
 	}
-	// sort để toàn bộ node có cùng thứ tự
 	parties = tss.SortPartyIDs(parties)
 	peerCtx := tss.NewPeerContext(parties)
 	curve := tss.S256()
 
-	// ======== 2. Sinh pre-params (Paillier, safe primes, ...) ========
-	// nên làm trước vì khá nặng
+	// 2. pre-params (nặng, nên tái sử dụng)
 	preParams, err := keygen.GeneratePreParams(1 * time.Minute)
 	if err != nil {
-		log.Fatalf("generate pre-params fail: %v", err)
+		log.Fatalf("generate preparams: %v", err)
 	}
 
-	// ======== 3. Tạo 3 local parties chạy keygen ========
-	var (
-		pList    []*localParty
-		wgKeygen sync.WaitGroup
-	)
-	wgKeygen.Add(partyCount)
+	// 3. chạy keygen cho 3 node trong memory
+	kgNodes := make([]*kgNode, 0, partyCount)
+	nodeMap := make(map[string]*kgNode, partyCount)
 
-	// map để định tuyến message
-	partyMap := make(map[string]*localParty)
-
-	for idx, pid := range parties {
-		// mỗi party có out channel riêng
+	for _, pid := range parties {
 		outCh := make(chan tss.Message, partyCount)
 		endCh := make(chan *keygen.LocalPartySaveData, 1)
 
 		params := tss.NewParameters(curve, peerCtx, pid, partyCount, threshold)
 
-		lp := keygen.NewLocalParty(params, outCh, endCh, *preParams)
+		// chú ý: NewLocalParty(..., preParams) nhận giá trị, không phải pointer
+		p := keygen.NewLocalParty(params, outCh, endCh, *preParams)
 
-		lpWrap := &localParty{
+		n := &kgNode{
 			id:    pid,
-			party: lp,
-			outCh: outCh,
-			endKg: endCh,
+			party: p,
+			out:   outCh,
+			done:  endCh,
 		}
-		pList = append(pList, lpWrap)
-		partyMap[pid.Id] = lpWrap
-
-		go func(p tss.Party, who string) {
-			defer wgKeygen.Done()
-			if err := p.Start(); err != nil {
-				log.Printf("[%s] keygen start err: %v", who, err)
-			}
-		}(lp, pid.Id)
-
-		// mỗi party có goroutine đọc outCh và forward sang các party khác
-		go func(from *localParty) {
-			for msg := range from.outCh {
-				routeMessage(msg, from.id, partyMap)
-			}
-		}(lpWrap)
-
-		_ = idx
+		kgNodes = append(kgNodes, n)
+		nodeMap[pid.Id] = n
 	}
 
-	// ======== 4. Thu kết quả keygen ========
-	keygenDone := 0
-	keyDataByID := make(map[string]*keygen.LocalPartySaveData)
+	// forward message cho pha keygen
+	for _, n := range kgNodes {
+		go func(me *kgNode) {
+			for msg := range me.out {
+				routeKG(msg, me.id, nodeMap)
+			}
+		}(n)
+	}
 
-	for keygenDone < partyCount {
-		for _, p := range pList {
+	// start từng party
+	for _, n := range kgNodes {
+		if err := n.party.Start(); err != nil {
+			log.Fatalf("[%s] start keygen: %v", n.id.Id, err)
+		}
+	}
+
+	// chờ thu 3 kết quả
+	keyDataByID := make(map[string]*keygen.LocalPartySaveData, partyCount)
+	doneCount := 0
+	for doneCount < partyCount {
+		for _, n := range kgNodes {
 			select {
-			case data := <-p.endKg:
-				keygenDone++
-				keyDataByID[p.id.Id] = data
-				log.Printf("[%s] keygen DONE", p.id.Id)
+			case data := <-n.done:
+				keyDataByID[n.id.Id] = data
+				doneCount++
+				log.Printf("[%s] KEYGEN DONE", n.id.Id)
 			default:
-				// nothing
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	wgKeygen.Wait()
 
-	// ta có public key chung (giống nhau ở mọi node)
-	pub := keyDataByID[pList[0].id.Id].ECDSAPub
-	log.Printf("==> Public key (X,Y):\nX = %s\nY = %s", pub.X().String(), pub.Y().String())
-	// bạn có thể chuyển pub này sang địa chỉ Ethereum, rồi nhét vào HTLC
+	// public key chung
+	pub := keyDataByID[kgNodes[0].id.Id].ECDSAPub
+	log.Printf("==> pubkey X=%s\nY=%s", pub.X().String(), pub.Y().String())
 
-	// ======== 5. Bây giờ ký ngưỡng với 2/3 node ========
+	// 4. SIGN 2-of-3
 	msg := sha256.Sum256([]byte("mpc-sign-for-mp-htlc-lgp"))
-	m := msg[:]
-	log.Printf("message hash = %s", hex.EncodeToString(m))
+	m := new(big.Int).SetBytes(msg[:])
 
-	// chọn 2 node đầu để ký
-	signers := []*localParty{pList[0], pList[1]}
+	// chọn 2 signer đầu
+	signerParties := []*tss.PartyID{kgNodes[0].id, kgNodes[1].id}
+	signerParties = tss.SortPartyIDs(signerParties)
+	signerCtx := tss.NewPeerContext(signerParties)
 
-	// chuẩn bị channels cho signing
-	var wgSign sync.WaitGroup
-	wgSign.Add(len(signers))
+	// tạo map để định tuyến riêng cho pha ký
+	signMap := make(map[string]*signNode, len(signerParties))
+	signNodes := make([]*signNode, 0, len(signerParties))
 
-	// ta cần peer context chỉ cho 2 signer này
-	signerIDs := []*tss.PartyID{signers[0].id, signers[1].id}
-	signerIDs = tss.SortPartyIDs(signerIDs)
-	signerCtx := tss.NewPeerContext(signerIDs)
-
-	// map riêng cho phase ký
-	signerMap := make(map[string]*localParty)
-
-	for _, sp := range signers {
-		outCh := make(chan tss.Message, len(signers))
+	for _, kgN := range kgNodes[:2] {
+		outCh := make(chan tss.Message, len(signerParties))
 		endCh := make(chan *common.SignatureData, 1)
 
-		params := tss.NewParameters(curve, signerCtx, sp.id, len(signers), threshold)
+		params := tss.NewParameters(curve, signerCtx, kgN.id, len(signerParties), threshold)
 
-		// lấy key share từ bước keygen
-		keyData := keyDataByID[sp.id.Id]
+		sParty := signing.NewLocalParty(m, params, *keyDataByID[kgN.id.Id], outCh, endCh)
 
-		sParty := signing.NewLocalParty(new(big.Int).SetBytes(m), params, *keyData, outCh, endCh)
-
-		sp.outCh = outCh
-		sp.endSig = endCh
-		sp.party = sParty
-		signerMap[sp.id.Id] = sp
-
-		go func(p tss.Party, who string) {
-			defer wgSign.Done()
-			if err := p.Start(); err != nil {
-				log.Printf("[%s] signing start err: %v", who, err)
-			}
-		}(sParty, sp.id.Id)
-
-		go func(from *localParty) {
-			for msg := range from.outCh {
-				routeMessage(msg, from.id, signerMap)
-			}
-		}(sp)
+		sn := &signNode{
+			id:    kgN.id,
+			party: sParty,
+			out:   outCh,
+			done:  endCh,
+		}
+		signNodes = append(signNodes, sn)
+		signMap[kgN.id.Id] = sn
 	}
 
-	// chờ chữ ký
-	sigCollected := 0
+	// forward cho pha ký
+	for _, n := range signNodes {
+		go func(me *signNode) {
+			for msg := range me.out {
+				routeSign(msg, me.id, signMap)
+			}
+		}(n)
+	}
+
+	// start ký
+	for _, n := range signNodes {
+		if err := n.party.Start(); err != nil {
+			log.Fatalf("[%s] start sign: %v", n.id.Id, err)
+		}
+	}
+
+	// thu chữ ký
 	var finalSig *common.SignatureData
-	for sigCollected < len(signers) {
-		for _, sp := range signers {
+	doneSig := 0
+	for doneSig < len(signNodes) {
+		for _, n := range signNodes {
 			select {
-			case sig := <-sp.endSig:
-				sigCollected++
-				// tất cả nhận cùng 1 sig, nên lấy cái đầu
+			case sig := <-n.done:
+				doneSig++
 				if finalSig == nil {
 					finalSig = sig
 				}
-				log.Printf("[%s] signing DONE", sp.id.Id)
+				log.Printf("[%s] SIGN DONE", n.id.Id)
 			default:
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	wgSign.Wait()
 
 	if finalSig == nil {
-		log.Fatalf("signing failed, no signature collected")
+		log.Fatal("signing failed, no signature")
 	}
 
 	// in chữ ký
-	r := finalSig.R
-	s := finalSig.S
-	log.Printf("==> Threshold signature:")
-	log.Printf("r = %s", hex.EncodeToString(r))
-	log.Printf("s = %s", hex.EncodeToString(s))
-	log.Printf("recid = %d (dùng để dựng chữ ký kiểu Ethereum)", finalSig.SignatureRecovery)
+	fmt.Printf("==> TSS signature:\n")
+	fmt.Printf("r = %s\n", hex.EncodeToString(finalSig.R))
+	fmt.Printf("s = %s\n", hex.EncodeToString(finalSig.S))
+	fmt.Printf("v(recid) = %d\n", finalSig.SignatureRecovery)
+
+	// 5. verify lại bằng ecdsa chuẩn
+	ok := verifyECDSA(pub, msg[:], finalSig.R, finalSig.S)
+	fmt.Printf("ECDSA verify = %v\n", ok)
+
+	// 6. nếu cần chữ ký kiểu Ethereum 65 byte để gửi sang chain:
+	ethSig := makeEthSignature(finalSig.R, finalSig.S, finalSig.SignatureRecovery)
+	fmt.Printf("ethSig(65) = 0x%s\n", hex.EncodeToString(ethSig))
 
 	fmt.Println("DONE.")
 }
 
-// routeMessage chuyển 1 message TSS từ 'from' sang các party còn lại
-func routeMessage(msg tss.Message, from *tss.PartyID, partyMap map[string]*localParty) {
-	wireBytes, routing, err := msg.WireBytes()
+// === routing cho keygen ===
+func routeKG(msg tss.Message, from *tss.PartyID, nodes map[string]*kgNode) {
+	wire, routing, err := msg.WireBytes()
 	if err != nil {
-		log.Printf("wirebytes err: %v", err)
+		log.Printf("KG wire err: %v", err)
 		return
 	}
-
 	if routing.IsBroadcast {
-		for id, p := range partyMap {
+		for id, n := range nodes {
 			if id == from.Id {
 				continue
 			}
-			if ok, err2 := p.party.UpdateFromBytes(wireBytes, from, true); !ok || err2 != nil {
-				log.Printf("broadcast to %s failed: %v", id, err2)
+			if ok, err2 := n.party.UpdateFromBytes(wire, from, true); !ok || err2 != nil {
+				log.Printf("KG broadcast -> %s fail: %v", id, err2)
 			}
 		}
 		return
 	}
-
-	// point-to-point
 	for _, to := range routing.To {
-		dst, ok := partyMap[to.Id]
-		if !ok {
-			log.Printf("no party %s in map", to.Id)
-			continue
-		}
-		if ok2, err2 := dst.party.UpdateFromBytes(wireBytes, from, false); !ok2 || err2 != nil {
-			log.Printf("unicast to %s failed: %v", to.Id, err2)
+		dst := nodes[to.Id]
+		if ok, err2 := dst.party.UpdateFromBytes(wire, from, false); !ok || err2 != nil {
+			log.Printf("KG unicast -> %s fail: %v", to.Id, err2)
 		}
 	}
+}
+
+// === routing cho signing ===
+func routeSign(msg tss.Message, from *tss.PartyID, nodes map[string]*signNode) {
+	wire, routing, err := msg.WireBytes()
+	if err != nil {
+		log.Printf("SIGN wire err: %v", err)
+		return
+	}
+	if routing.IsBroadcast {
+		for id, n := range nodes {
+			if id == from.Id {
+				continue
+			}
+			if ok, err2 := n.party.UpdateFromBytes(wire, from, true); !ok || err2 != nil {
+				log.Printf("SIGN broadcast -> %s fail: %v", id, err2)
+			}
+		}
+		return
+	}
+	for _, to := range routing.To {
+		dst := nodes[to.Id]
+		if ok, err2 := dst.party.UpdateFromBytes(wire, from, false); !ok || err2 != nil {
+			log.Printf("SIGN unicast -> %s fail: %v", to.Id, err2)
+		}
+	}
+}
+
+// verify ECDSA chuẩn
+func verifyECDSA(pub interface {
+	X() *big.Int
+	Y() *big.Int
+}, msg []byte, rBz, sBz []byte) bool {
+	x := pub.X()
+	y := pub.Y()
+	r := new(big.Int).SetBytes(rBz)
+	s := new(big.Int).SetBytes(sBz)
+	ecdsaPub := ecdsa.PublicKey{
+		Curve: elliptic.P256(), // tss.S256() cũng là secp256k1 → nếu bạn build bằng go-ethereum thì dùng btcec
+		X:     x,
+		Y:     y,
+	}
+	return ecdsa.Verify(&ecdsaPub, msg, r, s)
+}
+
+func makeEthSignature(rBz, sBz []byte, recid []byte) []byte {
+	var v byte
+	if len(recid) > 0 {
+		v = recid[0]
+	} else {
+		v = 0
+	}
+	sig := make([]byte, 65)
+	copy(sig[0:32], rBz)
+	copy(sig[32:64], sBz)
+	sig[64] = v
+	return sig
 }
