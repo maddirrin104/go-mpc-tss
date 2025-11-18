@@ -2,18 +2,21 @@ package main
 
 import (
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
+
+	"os"
 	"time"
 
 	"github.com/bnb-chain/tss-lib/v2/common"
 	keygen "github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	signing "github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/joho/godotenv"
 )
 
 // ===== cấu hình demo =====
@@ -39,6 +42,11 @@ type signNode struct {
 }
 
 func main() {
+	// load .env into environment (optional). If there's no .env file this will just log and continue.
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found or failed to load .env")
+	}
+
 	// 1. tạo danh sách ID
 	parties := make([]*tss.PartyID, 0, partyCount)
 	for i := 0; i < partyCount; i++ {
@@ -49,12 +57,6 @@ func main() {
 	parties = tss.SortPartyIDs(parties)
 	peerCtx := tss.NewPeerContext(parties)
 	curve := tss.S256()
-
-	// 2. pre-params (nặng, nên tái sử dụng)
-	preParams, err := keygen.GeneratePreParams(1 * time.Minute)
-	if err != nil {
-		log.Fatalf("generate preparams: %v", err)
-	}
 
 	// 3. chạy keygen cho 3 node trong memory
 	kgNodes := make([]*kgNode, 0, partyCount)
@@ -67,6 +69,10 @@ func main() {
 		params := tss.NewParameters(curve, peerCtx, pid, partyCount, threshold)
 
 		// chú ý: NewLocalParty(..., preParams) nhận giá trị, không phải pointer
+		preParams, err := keygen.GeneratePreParams(1 * time.Minute) // có thể tăng timeout
+		if err != nil {
+			log.Fatalf("[%s] generate preparams: %v", pid.Id, err)
+		}
 		p := keygen.NewLocalParty(params, outCh, endCh, *preParams)
 
 		n := &kgNode{
@@ -114,10 +120,23 @@ func main() {
 	// public key chung
 	pub := keyDataByID[kgNodes[0].id.Id].ECDSAPub
 	log.Printf("==> pubkey X=%s\nY=%s", pub.X().String(), pub.Y().String())
+	ecdsaPub := ecdsa.PublicKey{
+		Curve: crypto.S256(),
+		X:     pub.X(),
+		Y:     pub.Y(),
+	}
+	ethAddr := crypto.PubkeyToAddress(ecdsaPub)
+	fmt.Printf("TSS Ethereum Address = %s\n", ethAddr.Hex())
 
 	// 4. SIGN 2-of-3
-	msg := sha256.Sum256([]byte("mpc-sign-for-mp-htlc-lgp"))
-	m := new(big.Int).SetBytes(msg[:])
+	// msg := sha256.Sum256([]byte("mpc-sign-for-mp-htlc-lgp")) cái này cũ rồi
+	preimage := os.Getenv("PREIMAGE")
+	if preimage == "" {
+		log.Fatal("PREIMAGE not set")
+	}
+	msg := sha256.Sum256([]byte(preimage))
+	fmt.Printf("lockId: 0x%x\n", msg[:])
+	m := new(big.Int).SetBytes(msg[:]) // message để TSS ký
 
 	// chọn 2 signer đầu
 	signerParties := []*tss.PartyID{kgNodes[0].id, kgNodes[1].id}
@@ -263,7 +282,7 @@ func verifyECDSA(pub interface {
 	r := new(big.Int).SetBytes(rBz)
 	s := new(big.Int).SetBytes(sBz)
 	ecdsaPub := ecdsa.PublicKey{
-		Curve: elliptic.P256(), // tss.S256() cũng là secp256k1 → nếu bạn build bằng go-ethereum thì dùng btcec
+		Curve: crypto.S256(), // tss.S256() cũng là secp256k1 → nếu bạn build bằng go-ethereum thì dùng btcec
 		X:     x,
 		Y:     y,
 	}
